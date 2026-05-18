@@ -30,10 +30,10 @@ This skill migrates a Hermes profile's historical sessions from the default FTS5
 
 ```bash
 # Check Ollama
-curl -s http://localhost:11434/api/tags | python3 -c "import sys,json; models=[m['name'] for m in json.load(sys.stdin)['models']]; print('bge-m3:567m' in models and 'OK' or 'MISSING')"
+bash scripts/check_ollama.sh
 
 # Install lancedb
-~/.hermes/venv/bin/pip install lancedb
+uv pip install --python ~/.hermes/venv/bin/python lancedb
 ```
 
 ## Quick Start
@@ -132,7 +132,7 @@ WARNING: Model 'bge-m3:567m' not loaded
 
 Check actual model names:
 ```bash
-curl -s http://localhost:11434/api/tags | python3 -c "import sys,json; [print(m['name']) for m in json.load(sys.stdin)['models']]"
+bash scripts/check_ollama.sh && ollama list | grep "bge-m3:567m"
 ```
 
 ### Sub-agent memory disabled by default

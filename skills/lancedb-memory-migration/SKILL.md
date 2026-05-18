@@ -1,7 +1,7 @@
 ---
 name: lancedb-memory-migration
-description: "Migrate a Hermes profile's session history from FTS5 (built-in session search) to LanceDB vector memory. Use when switching a profile (especially sub-agent profiles) to the LanceDB-backed memory system. Handles state.db → LanceDB migration, config changes, and verification. Requires: Ollama with bge-m3:567m, lancedb pip package."
-version: 1.0.0
+description: "Migrate a Hermes profile's session history from FTS5 (built-in session search) to LanceDB vector memory. Uses unified script with built-in Strip Pipeline — no separate optimization needed. Requires: Ollama with bge-m3:567m, lancedb pip package."
+version: 2.0.0
 author: Hermes Agent + Kuntao
 license: MIT
 metadata:
@@ -50,13 +50,26 @@ Hermes Agent (vec_memory_* tools)
 
 ### 1. Ollama 服务 + bge-m3:567m 模型
 
+**Step 1a: 启动 Ollama**
 ```bash
-# 检查 Ollama 是否运行
-bash scripts/check_ollama.sh
+# 检查是否已运行
+curl -s http://localhost:11434/api/tags && echo "Ollama already running"
 
-# 如果没有，拉取模型
+# 如果未运行，启动它（用户环境：WSL2 Ubuntu）
+ollama serve &
+sleep 5
+```
+
+**Step 1b: 检查/拉取模型**
+```bash
+# 查看已加载模型
+ollama list
+
+# 如果没有 bge-m3:567m，拉取（需要能访问 huggingface）
 ollama pull bge-m3:567m
 ```
+
+> **Pitfall — Ollama 在 WSL2 中需要手动启动。** 如果 Ollama 未运行，迁移脚本会直接 abort 并报错 `ERROR: Cannot reach Ollama at http://localhost:11434`。每次重启 WSL 后都需要重新 `ollama serve &`。确保模型已加载后再运行迁移脚本。
 
 ### 2. lancedb Python 包
 
@@ -64,302 +77,23 @@ ollama pull bge-m3:567m
 uv pip install --python ~/.hermes/venv/bin/python lancedb
 ```
 
-## Step 1: 创建迁移脚本
+## Step 1: 运行统一迁移脚本
 
-在 `~/.hermes/scripts/` 下创建迁移脚本，文件名格式：`migrate_<profile>_sessions_to_lancedb.py`
+迁移脚本已统一为 `migrate_sessions_to_lancedb.py`，通过 `--profile` 参数指定目标 profile，无需为每个 profile 单独创建脚本。
 
-**需要修改的配置项（在脚本顶部）：**
+```bash
+# Dry-run 查看待迁移 session
+~/.hermes/venv/bin/python3 ~/.hermes/scripts/migrate_sessions_to_lancedb.py \
+  --profile <profile_name> --dry-run
 
-```python
-PROFILE = "<你的profile名>"           # 例如: "chip_expert", "financial_expert"
-OLLAMA_HOST = "http://localhost:11434"  # 根据你的环境调整
-OLLAMA_MODEL = "bge-m3:567m"            # Ollama 中的模型名，需与实际一致
-VECTOR_DIM = 1024                        # bge-m3:567m 输出维度，勿改动
-MIN_ASST_CHARS = 200                     # assistant 内容少于这个字符的 session 跳过
+# 执行迁移
+~/.hermes/venv/bin/python3 ~/.hermes/scripts/migrate_sessions_to_lancedb.py \
+  --profile <profile_name>
 ```
 
-**完整脚本模板：**
+**★ 内置 Strip Pipeline：** 迁移脚本现在在写入 LanceDB 前自动运行 5 阶段 Strip Pipeline（prefix → assistant_frontmatter → trailing → embedded_meta → quality_gate），消除 skill 模板前缀污染。迁移后无需单独运行优化脚本。
 
-```python
-#!/usr/bin/env python3
-"""
-Migrate session history from <PROFILE>'s state.db to LanceDB vector memory.
-
-Usage:
-    python migrate_<profile>_sessions_to_lancedb.py [--dry-run]
-"""
-
-import argparse
-import sqlite3
-import time
-from pathlib import Path
-import numpy as np
-import requests
-import json
-import uuid
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-# TODO: 修改以下配置项
-PROFILE = "<profile名>"                                    # 例如: "chip_expert"
-HERMES_HOME = Path.home() / ".hermes"
-PROFILE_HOME = HERMES_HOME / "profiles" / PROFILE
-OLLAMA_HOST = "http://localhost:11434"                     # 根据环境调整
-OLLAMA_MODEL = "bge-m3:567m"                               # 确保与 Ollama 模型名一致
-VECTOR_DIM = 1024                                           # bge-m3:567m 维度，勿改动
-MIN_ASST_CHARS = 200                                        # assistant 内容少于此值则跳过
-
-# ─── Ollama embed via HTTP API ────────────────────────────────────────────────
-def ollama_embed(texts: list[str]) -> list[np.ndarray]:
-    resp = requests.post(
-        f"{OLLAMA_HOST}/api/embed",
-        json={"model": OLLAMA_MODEL, "input": texts},
-        timeout=300,  # 大 session 可能需要较长时间
-    )
-    resp.raise_for_status()
-    return [np.array(e, dtype=np.float32) for e in resp.json()["embeddings"]]
-
-def check_ollama() -> bool:
-    try:
-        resp = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-        models = [m["name"] for m in resp.json().get("models", [])]
-        if OLLAMA_MODEL not in models:
-            print(f"WARNING: Model '{OLLAMA_MODEL}' not loaded.")
-            print(f"  Loaded: {models}")
-            return False
-        return True
-    except Exception as e:
-        print(f"ERROR: Cannot reach Ollama: {e}")
-        return False
-
-# ─── LanceDB Schema ───────────────────────────────────────────────────────────
-def build_schema():
-    import pyarrow as pa
-    return pa.schema([
-        pa.field("id",         pa.string()),
-        pa.field("content",    pa.string()),
-        pa.field("role",       pa.string()),
-        pa.field("session_id", pa.string()),
-        pa.field("vector",     pa.list_(pa.float32(), VECTOR_DIM)),
-        pa.field("created_at", pa.float64()),
-        pa.field("metadata",   pa.string()),
-    ])
-
-def get_or_create_lance_db():
-    import lancedb
-    lance_dir = PROFILE_HOME / "lance_memory"
-    lance_dir.mkdir(parents=True, exist_ok=True)
-    db = lancedb.connect(str(lance_dir))
-    table_name = "memories"
-    if table_name not in db.table_names():
-        db.create_table(table_name, schema=build_schema())
-        print(f"  Created: {lance_dir}")
-    return db, table_name
-
-def get_existing_session_ids(table) -> set[str]:
-    try:
-        all_rows = table.search([0.0] * VECTOR_DIM).limit(10000).to_list()
-        return {r["session_id"] for r in all_rows if r.get("session_id")}
-    except Exception:
-        return set()
-
-# ─── Session processor (single-pass) ─────────────────────────────────────────
-# TODO: 根据需要调整过滤关键词（应与你的语言环境匹配）
-SHORT_PATTERNS = [
-    "你好", "您好", "hello",
-    "你是什么模型", "你现在用的什么模型", "现在你是什么模型",
-    "有什么我可以帮", "有什么能帮",
-]
-
-def process_session(raw_rows: list, session_id: str, started_at: float,
-                    start_dt: str, msg_count: int) -> dict | None:
-    """
-    单次遍历：同时判断是否有价值并提取内容。
-    返回 None 表示不值得迁移，否则返回迁移数据字典。
-
-    内容格式与原始 Ollama embed 写入格式一致：
-    [user]
-    xxx
-    [assistant]
-    yyy
-
-    [user]
-    xxx
-    [assistant]
-    yyy
-    ...
-    """
-    user_msgs, asst_msgs = [], []
-    for role, content in raw_rows:
-        if role not in ('user', 'assistant'):
-            continue
-        if not content or not content.strip():
-            continue
-        if role == 'user' and len(content.strip()) < 5:
-            continue
-        if role == 'user':
-            user_msgs.append(content.strip())
-        else:
-            asst_msgs.append(content.strip())
-
-    if not user_msgs or not asst_msgs:
-        return None
-    if all(len(m) < 10 for m in user_msgs):
-        return None
-    pure_confirmation = all(
-        any(p in m for p in SHORT_PATTERNS) and len(m) < 30
-        for m in user_msgs
-    )
-    if pure_confirmation:
-        return None
-    total_asst = sum(len(m) for m in asst_msgs)
-    if total_asst < MIN_ASST_CHARS:
-        return None
-
-    # 按 user/assistant 顺序交替拼接
-    lines = []
-    for user_c, asst_c in zip(user_msgs, asst_msgs):
-        lines.append(f"[user]\n{user_c}")
-        lines.append(f"[assistant]\n{asst_c}")
-    if len(user_msgs) > len(asst_msgs):
-        for content in user_msgs[len(asst_msgs):]:
-            lines.append(f"[user]\n{content}")
-            lines.append("[assistant]\n")
-
-    content = "\n\n".join(lines)
-    if len(content) < 50:
-        return None
-
-    return {
-        "session_id": session_id,
-        "started_at": started_at,
-        "start_dt": start_dt,
-        "msg_count": msg_count,
-        "asst_chars": total_asst,
-        "content": content,
-        "preview": content[:200].replace("\n", " "),
-    }
-
-# ─── Migration ─────────────────────────────────────────────────────────────────
-def migrate(dry_run: bool = False):
-    t0 = time.time()
-    state_db = PROFILE_HOME / "state.db"
-    if not state_db.exists():
-        print(f"ERROR: state.db not found: {state_db}")
-        return
-
-    print("=" * 60)
-    print("Session History Migration: state.db → LanceDB")
-    print(f"Profile: {PROFILE}")
-    print("=" * 60)
-    print(f"  Source:   {state_db}")
-    print(f"  Ollama:   {OLLAMA_HOST}")
-    print(f"  Model:    {OLLAMA_MODEL}")
-    print(f"  Min asst: {MIN_ASST_CHARS} chars")
-    print(f"  Dry run:  {dry_run}\n")
-
-    if not check_ollama():
-        print("ERROR: Ollama check failed. Aborting.")
-        return
-
-    conn = sqlite3.connect(str(state_db))
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, message_count, started_at,
-               datetime(started_at, 'unixepoch') as start_dt
-        FROM sessions WHERE message_count > 0 ORDER BY started_at
-    """)
-    sessions = cur.fetchall()
-    print(f"Found {len(sessions)} sessions with messages.\n")
-
-    db, table_name = get_or_create_lance_db()
-    table = db.open_table(table_name)
-    existing_ids = get_existing_session_ids(table)
-    print(f"LanceDB already has {len(existing_ids)} sessions.\n")
-
-    sessions_to_migrate, skipped_already, skipped_short = [], 0, 0
-    for sid, msg_count, started_at, start_dt in sessions:
-        if sid in existing_ids:
-            skipped_already += 1
-            continue
-        cur.execute("""
-            SELECT role, content FROM messages
-            WHERE session_id = ? ORDER BY timestamp
-        """, (sid,))
-        raw = cur.fetchall()
-        result = process_session(raw, sid, started_at, start_dt, msg_count)
-        if result:
-            sessions_to_migrate.append(result)
-        else:
-            skipped_short += 1
-    conn.close()
-
-    print(f"=== Summary ===")
-    print(f"  Total sessions:    {len(sessions)}")
-    print(f"  Already migrated: {skipped_already}")
-    print(f"  Skipped (short): {skipped_short}")
-    print(f"  To migrate:       {len(sessions_to_migrate)}\n")
-
-    if not sessions_to_migrate:
-        print("No new sessions to migrate.")
-        return
-
-    print("=== Sessions ===\n")
-    for s in sessions_to_migrate:
-        print(f"  {s['session_id']}  started:{s['start_dt']}  "
-              f"asst:{s['asst_chars']}chars  preview:{s['preview'][:80]}...")
-        print()
-
-    if dry_run:
-        print(f"[DRY RUN] Would migrate {len(sessions_to_migrate)} sessions.")
-        return
-
-    print(f"=== Migrating {len(sessions_to_migrate)} sessions ===\n")
-    migrated, errors = 0, 0
-    for batch_start in range(0, len(sessions_to_migrate), 4):
-        batch = sessions_to_migrate[batch_start:batch_start + 4]
-        texts = [s["content"] for s in batch]
-        try:
-            embeddings = ollama_embed(texts)
-        except Exception as e:
-            print(f"  ERROR embedding: {e}")
-            errors += len(batch)
-            continue
-
-        now = time.time()
-        rows = []
-        for s, emb in zip(batch, embeddings):
-            rows.append({
-                "id": str(uuid.uuid4()),
-                "content": s["content"],
-                "role": "session_migrated",
-                "session_id": s["session_id"],
-                "vector": emb.tolist(),
-                "created_at": now,
-                "metadata": json.dumps({
-                    "started_at": s["start_dt"],
-                    "msg_count": s["msg_count"],
-                    "asst_chars": s["asst_chars"],
-                }),
-            })
-        try:
-            table.add(rows)
-            migrated += len(rows)
-            print(f"  [OK] Batch {batch_start}-{batch_start+len(batch)}: "
-                  f"{len(rows)} rows written")
-        except Exception as e:
-            print(f"  ERROR writing: {e}")
-            errors += len(batch)
-
-    print(f"\n{'='*60}")
-    print(f"Migration Complete")
-    print(f"  Migrated: {migrated}  Errors: {errors}  Time: {time.time()-t0:.1f}s")
-    print(f"  LanceDB total: {table.count_rows()} rows")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
-    migrate(dry_run=parser.parse_args().dry_run)
-```
+**★ Timestamp 修复：** `created_at` 使用消息自身的 timestamp，不再统一用写入时刻的 `time.time()`。
 
 ## Step 2: 修改 config.yaml
 
@@ -419,21 +153,24 @@ plugins:
 ### 4.1 Dry-run 验证
 
 ```bash
-~/.hermes/venv/bin/python3 ~/.hermes/scripts/migrate_<profile>_sessions_to_lancedb.py --dry-run
+~/.hermes/venv/bin/python3 ~/.hermes/scripts/migrate_sessions_to_lancedb.py \
+  --profile <profile_name> --dry-run
 ```
 
 预期输出：
 - 显示找到的 session 数量
 - 显示"Already migrated"数量（首次为0）
 - 列出将被迁移的 session 及其信息
+- 显示 Strip 阶段数和启用数
 
 ### 4.2 执行迁移
 
 ```bash
-~/.hermes/venv/bin/python3 ~/.hermes/scripts/migrate_<profile>_sessions_to_lancedb.py
+~/.hermes/venv/bin/python3 ~/.hermes/scripts/migrate_sessions_to_lancedb.py \
+  --profile <profile_name>
 ```
 
-> 大 session（>20000字符）的嵌入可能需要 60-300 秒，受 Ollama 模型处理速度影响。
+> ★ 迁移脚本内置 Strip Pipeline，写入的是净化后的内容。迁移完成后会输出 Strip ratio。无需再单独运行 optimize_lance_memory.py。
 
 ### 4.3 幂等性
 
@@ -450,53 +187,92 @@ grep -n "provider:" ~/.hermes/profiles/<profile>/config.yaml | grep memory
 # 期望输出包含: provider: lancedb-embed
 ```
 
-### 5.2 LanceDB 数据检查
+### 5.2 LanceDB / Ollama Embed 数据检查
 
+**⚠️ Critical: Use the correct system.** The `vec_memory_*` tools use LanceDB `.lance` format (see `references/lancedb-lance-storage.md`), NOT `ollama_embed.db`.
+
+**LanceDB `.lance` system (correct — use this):**
 ```bash
-# 检查 LanceDB 目录和文件
-ls -la ~/.hermes/profiles/<profile>/lance_memory/memories.lance
-du -sh ~/.hermes/profiles/<profile>/lance_memory/
+# 物理文件
+ls ~/.hermes/lance_memory/memories.lance/
 
-# 检查行数
-~/.hermes/venv/bin/python3 -c "
-import lancedb
-db = lancedb.connect('~/.hermes/profiles/<profile>/lance_memory')
-table = db.open_table('memories')
-print(f'Rows: {table.count_rows()}')
+# Python inspection
+~/.hermes/venv/bin/python -c "
+import lancedb, datetime
+db = lancedb.connect('/home/ktao/.hermes/lance_memory')
+tbl = db.open_table('memories')
+df = tbl.to_pandas()
+df['ts'] = df['created_at'].apply(lambda x: datetime.datetime.fromtimestamp(x))
+df_sorted = df.sort_values('ts', ascending=False)
+print(f'Total: {len(df)} | Distinct sessions: {df[\"session_id\"].nunique()}')
+print('Date range:', df['ts'].min().date(), '~', df['ts'].max().date())
+print()
+print('=== Date distribution ===')
+df['date'] = df['ts'].dt.date
+for d, c in df['date'].value_counts().sort_index(ascending=False).items():
+    print(f'  {d}: {c}')
+print()
+print('=== Latest 5 ===')
+for _, r in df_sorted.head(5).iterrows():
+    print(f'  {r[\"ts\"].strftime(\"%Y-%m-%d %H:%M\")}  {r[\"role\"]}')
 "
+
+# Schema (用于验证列名)
+~/.hermes/venv/bin/python -c "
+import lancedb
+db = lancedb.connect('/home/ktao/.hermes/lance_memory')
+print(db.open_table('memories').schema)
+"
+```
+
+> **Column name note:** The LanceDB table uses `created_at` (Unix timestamp as double), NOT `timestamp`. The `metadata` column is always `"{}"` (empty JSON). See `references/lancedb-lance-storage.md` for full schema and probe script.
+
+**ollama_embed.db system (legacy — only if you know this is your target):**
+```bash
+file ~/.hermes/ollama_embed.db
+sqlite3 ~/.hermes/ollama_embed.db "SELECT COUNT(*) FROM memories; SELECT MIN(created_at), MAX(created_at) FROM memories;"
+```
 ```
 
 ### 5.3 Ollama 模型检查
 
 ```bash
-bash scripts/check_ollama.sh
+# Step 1: 确认 Ollama 进程在跑
+curl -s http://localhost:11434/api/tags && echo "Ollama OK"
+
+# Step 2: 确认模型已加载
+ollama list | grep bge-m3:567m
 ```
+
+> 如果 `curl` 报错 "Failed to connect"，先 `ollama serve &` 启动服务。
 
 ### 5.4 向量搜索联动测试
 
 ```bash
-~/.hermes/venv/bin/python3 -c "
+~/.hermes/venv/bin/python -c "
 import lancedb, json, requests, numpy as np
 
 OLLAMA_HOST = 'http://localhost:11434'
 OLLAMA_MODEL = 'bge-m3:567m'
-LANCE_DIR = '~/.hermes/profiles/<profile>/lance_memory'
+LANCE_DIR = '/home/ktao/.hermes/lance_memory'  # 或 profiles/<name>/lance_memory
 
 # 获取查询向量
 texts = ['<与profile相关的测试查询词>']
 resp = requests.post(f'{OLLAMA_HOST}/api/embed', json={'model': OLLAMA_MODEL, 'input': texts}, timeout=60)
 emb = np.array(resp.json()['embeddings'][0], dtype=np.float32)
 
-# 搜索
+# 搜索（使用 lancedb.connect，NOT lancedb.open）
 db = lancedb.connect(LANCE_DIR)
 table = db.open_table('memories')
 results = table.search(emb).limit(3).to_list()
 print(f'Found {len(results)} results:')
 for r in results:
     meta = json.loads(r.get('metadata', '{}'))
-    print(f'  {r[\"session_id\"]} dist={r.get(\"_distance\",\"N/A\")} asst={meta.get(\"asst_chars\",\"?\")}')
+    print(f'  {r['session_id']} dist={r.get('_distance','N/A')} role={r.get('role')}')
 "
 ```
+
+> **API note:** Use `lancedb.connect()` (not `lancedb.open()`) — the latter raises `AttributeError`.
 
 ### 5.5 Gateway 重启（如果需要）
 
@@ -510,7 +286,33 @@ systemctl --user list-units | grep hermes
 systemctl --user restart hermes-gateway-<profile>.service
 ```
 
+## Post-Migration Optimization
+
+**★ Strip Pipeline is now built into the migration script.** Raw content is stripped before writing to LanceDB (5 stages: prefix → assistant_frontmatter → trailing → embedded_meta → quality_gate). The separate `optimize_lance_memory.py` is still available for:
+
+- **Twig-level splitting** — split long sessions into smaller, independently retrievable units
+- **Twig-level dedup** — cosine dedup at finer granularity
+- **Incremental optimization** — process new sessions only
+- **Pattern discovery** — detect new template patterns
+
+Run it periodically after migration if you want Twig splitting:
+
+```bash
+~/.hermes/venv/bin/python3 ~/.hermes/scripts/optimize_lance_memory.py \
+  --profile <profile_name> --apply --incremental
+```
+
+Summary of the optimization problem:
+- Skill invocation blocks (~4700 chars each) are identical across ALL sessions
+- Raw content embedding → cos ≈ 1.0 between unrelated sessions → search broken
+- Fix: Strip Pipeline removes template prefixes at migration time
+- Further: Twig split + dedup for fine-grained retrieval
+
 ## Pitfalls
+
+### 0. Naive migration stores raw content (FIXED — Strip now built-in)
+
+The unified `migrate_sessions_to_lancedb.py` now applies Strip Pipeline at write time, so migrated content is clean. If you run the old per-profile scripts, the raw content problem still exists — use the new script instead.
 
 ### 1. Ollama 模型名不匹配
 
@@ -545,17 +347,103 @@ bash scripts/check_ollama.sh | grep -q "OK" && ollama list | grep "bge-m3:567m"
 
 脚本中的拼接逻辑：按 user/assistant 顺序交替拼接，每一对是 `[user]\n用户内容\n[assistant]\n助手内容`。这样生成的内容与 Ollama embed 写入的原始格式一致，搜索时语义一致。
 
-### 5. Profile 独立性问题
+### 6. "No new memories after X date" — Real Usage Drop vs. Write Failure
+
+When the user reports "no new memories written after [date]" but they were using the system, the first step is to check the actual memory data before assuming a bug:
+
+**Step 1: Check the date distribution**
+```bash
+~/.hermes/venv/bin/python -c "
+import lancedb, datetime
+db = lancedb.connect('/home/ktao/.hermes/lance_memory')
+tbl = db.open_table('memories')
+df = tbl.to_pandas()
+df['ts'] = df['created_at'].apply(lambda x: datetime.datetime.fromtimestamp(x))
+df['date'] = df['ts'].dt.date
+for d, c in df['date'].value_counts().sort_index(ascending=False).items():
+    print(f'{d}: {c}')
+"
+```
+
+**If counts drop after a date — this is REAL usage drop, NOT a bug.** Check parallel evidence:
+- `gateway.log` inbound message count drops on same dates
+- `agent.log` shows fewer "Memory provider registered" events
+- Sub-agent profiles show near-zero messages on same dates
+
+**Actual write failures have these signatures (real bugs):**
+- `agent.log` shows `WARNING.*session_end batch store failed`
+- `agent.log` shows `Connection refused` to Ollama
+- Old date counts suddenly decrease (data corruption)
+
+**Do NOT assume the memory system is broken** just because fewer memories appear after a certain date. The date distribution IS the ground truth.
+
+### 8. 时间戳完整性链路（v2 修复 2026-05-17）
+
+**完整链路有 4 个缺口，均已修复：**
+
+| 缺口 | 文件 | 修复内容 |
+|------|------|---------|
+| 缺口1 | `run_agent.py` | `_sync_external_memory_for_turn()` 新增 `turn_timestamp` 参数，传 `time.time()` |
+| 缺口2 | `lancedb-embed/__init__.py` `sync_turn()` | metadata 从 `"{}"` 扩展为含 preview 的 JSON |
+| 缺口3 | `lancedb-embed/__init__.py` `on_session_end()` | metadata 扩展含 `user_ts`/`asst_ts`，`created_at` 优先用 user timestamp |
+| 缺口4 | `scripts/optimize_lance_memory.py` | 从 `state.db` 读消息时保留 timestamp，写入 `metadata.message_timestamps[]` |
+
+**实时写入的 fallback**：gateway 侧没有把飞书消息到达时间传下来，`run_agent` 层 fallback 到 `time.time()`（turn 完成时刻），这是当前能做到的最好方案。如需精确到消息级，需要 gateway 侧也传 Unix 时间戳格式。
+
+**Metadata 设计原则**：时间戳存 metadata 而非 content，避免污染向量空间。
+
+### 9. Profile 独立性问题
 
 各 profile 的 LanceDB 完全独立。如果多个 profile 想共用同一份记忆数据，需要手动 symlink 或统一 `lance_dir` 配置。
+
+### Storage Architecture (Two Systems)
+
+> **Critical fix (2026-05-16):** The `vec_memory_*` tools use **LanceDB `.lance` format** at `lance_memory/memories.lance`, NOT `ollama_embed.db`. `ollama_embed.db` is a **separate** SQLite store used only by the Ollama embed plugin. Do NOT confuse the two — see `references/actual-storage-format.md` for the authoritative schema.
+
+### System 1 — Ollama Embed SQLite (plugin-only, NOT for vec_memory tools)
+
+```
+~/.hermes/ollama_embed.db                    # default profile
+~/.hermes/profiles/<name>/ollama_embed.db     # sub-agent profiles
+```
+- **Format:** SQLite (NOT `.lance` directory)
+- **Purpose:** Only used by Ollama embed plugin internally. NOT queried by `vec_memory_*` tools.
+- **Tables:** `memories` + `sessions` (BLOB vectors, no ANN index)
+- See `references/actual-storage-format.md` Section 1
+
+### System 2 — LanceDB `.lance` (vec_memory tools — THIS IS THE ONE)
+
+```
+~/.hermes/lance_memory/memories.lance/        # default profile (confirmed 2026-05-16: 195 items)
+~/.hermes/profiles/<name>/lance_memory/        # sub-agent profiles
+```
+- **Format:** LanceDB `.lance` directory with HNSW index
+- **Purpose:** All `vec_memory_*` tools read/write here
+- **Schema (confirmed 2026-05-16):**
+  - `id`: string (UUID)
+  - `content`: string (stored text)
+  - `role`: string (`turn` / `session_migrated` / `session_end`)
+  - `session_id`: string (e.g. `20260513_223106_8757f640`)
+  - `vector`: fixed_size_list&lt;float32&gt;[1024]
+  - `created_at`: double (Unix timestamp)
+  - `metadata`: string (JSON, currently `{}`)
+- See `references/actual-storage-format.md` Section 2 and probe script
 
 ## File Locations
 
 | 文件 | 路径 |
 |------|------|
-| 迁移脚本 | `~/.hermes/scripts/migrate_<profile>_sessions_to_lancedb.py` |
+| 迁移脚本 | `~/.hermes/scripts/migrate_sessions_to_lancedb.py`（统一脚本，`--profile <name>` 指定目标）|
+| 优化脚本 | `~/.hermes/scripts/optimize_lance_memory.py` |
+| 验证脚本 | `references/verify-optimization.py`（通过 `skill_view(name='optimize-lance-memory', file_path='references/verify-optimization.py')` 访问） |
+| 优化状态 | `~/.hermes/profiles/<profile>/.optimization_state.json` |
+| **★ 向量记忆系统架构（权威）** | `references/vector-memory-architecture.md` |
+| **Strip Pipeline 架构详解** | `references/strip-pipeline-architecture.md` |
+| **优化指南** | `references/optimization-guide.md` |
+| **实际存储格式（权威）** | `references/actual-storage-format.md` |
+| **Plugin 内部机制** | `references/lancedb-embed-plugin-internals.md` |
+| **LanceDB .lance 系统** | `references/lancedb-lance-storage.md` |
 | Profile config | `~/.hermes/profiles/<profile>/config.yaml` |
-| LanceDB 数据 | `~/.hermes/profiles/<profile>/lance_memory/memories.lance` |
 | 原始 session | `~/.hermes/profiles/<profile>/state.db` |
 | lancedb-embed 插件 | `~/.hermes/plugins/memory/lancedb-embed/__init__.py` |
 | Ollama 服务 | `localhost:11434` |
