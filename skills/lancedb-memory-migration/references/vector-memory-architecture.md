@@ -58,7 +58,7 @@
 │  │  表: sessions (id, message_count, started_at) + messages (role, content,      │  │
 │  │       timestamp)                                                             │  │
 │  │  ★ 迁移脚本的源数据，优化脚本的查询源                                         │  │
-│  │  ~/.hermes/state.db (default)  /  ~/.hermes/profiles/<n>/state.db            │  │
+│  │  $HERMES_HOME/state.db (default)  /  ~/.hermes/profiles/<n>/state.db          │  │
 │  └─────────────────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -70,7 +70,7 @@
 | **Plugin** | `~/.hermes/plugins/memory/lancedb-embed/__init__.py` (765 行) | 5 个 tool 的实现：add/search/list/delete/stats |
 | **Ollama 嵌入** | `localhost:11434` / `bge-m3:567m` | 文本 → 1024 维向量 |
 | **LanceDB** | `~/.hermes/lance_memory/memories.lance/` | HNSW ANN 索引，向量搜索主力 |
-| **state.db** | `~/.hermes/state.db` (default) | 原始 session 消息，迁移/优化源数据 |
+| **state.db** | `$HERMES_HOME/state.db` (default) | 原始 session 消息，迁移/优化源数据 |
 | **ollama_embed.db** | `~/.hermes/ollama_embed.db` | ⚠️ 遗留系统，仅插件内部用 |
 | **迁移脚本** | `~/.hermes/scripts/migrate_<p>_sessions_to_lancedb.py` | FTS5 → LanceDB 批量迁移 |
 | **优化脚本** | `~/.hermes/scripts/optimize_lance_memory.py` | Strip + Twig + 去重 |
@@ -349,7 +349,7 @@ $HERMES_HOME/profiles/<name>/config.yaml                # 子 agent
   → plugins.lancedb-embed: {base_url, embedding_model, lance_dir, ...}
 
 # ─ 数据 ─
-~/.hermes/state.db                                     # default session 原始数据
+$HERMES_HOME/state.db                                     # default session 原始数据
 ~/.hermes/profiles/<name>/state.db                    # 子 profile session 原始数据
 ~/.hermes/lance_memory/memories.lance/                 # default 向量数据库
 ~/.hermes/profiles/<name>/lance_memory/                # 子 profile 向量数据库
@@ -386,7 +386,7 @@ $HERMES_HOME/profiles/<name>/config.yaml                # 子 agent
 
 | Agent 类型 | LanceDB 路径 | state.db 路径 |
 |-----------|-------------|---------------|
-| default agent | `~/.hermes/lance_memory/` | `~/.hermes/state.db` |
+| default agent | `~/.hermes/lance_memory/` | `$HERMES_HOME/state.db` |
 | 子 agent（`--profile <name>`） | `~/.hermes/profiles/<name>/lance_memory/` | `~/.hermes/profiles/<name>/state.db` |
 
 > ⚠️ Profile 间无配置继承。每个 profile（包括 default）必须独立配置 `memory.provider: lancedb-embed`。  
